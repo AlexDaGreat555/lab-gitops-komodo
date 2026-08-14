@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+if (($# != 1)); then
+  printf 'usage: %s EXPECTED_VERSION\n' "$0" >&2
+  exit 2
+fi
+
+readonly expected=$1
+temporary_directory=$(mktemp -d)
+trap 'rm --recursive --force -- "$temporary_directory"' EXIT
+
+printf '%s' "$expected" > "$temporary_directory/expected.txt"
+
+hosts=(127.0.0.1)
+if getent hosts host.docker.internal >/dev/null 2>&1; then
+  hosts+=(host.docker.internal)
+fi
+gateway=""
+if command -v ip >/dev/null 2>&1; then
+  gateway=$(ip route show default 2>/dev/null | awk 'NR == 1 { print $3 }')
+fi
+if [[ -n "$gateway" ]]; then
+  hosts+=("$gateway")
+fi
+
+for _ in {1..30}; do
+  for request_host in "${hosts[@]}"; do
+    status=$(curl \
+      --noproxy '*' \
+      --silent \
+      --max-time 1 \
+      --output "$temporary_directory/body.txt" \
+      --write-out '%{http_code}' \
+      "http://${request_host}:8080/version" || true)
+
+    if [[ "$status" == 200 ]] && \
+       cmp --silent "$temporary_directory/expected.txt" "$temporary_directory/body.txt"; then
+      printf 'Smoke test passed: %s\n' "$expected"
+      exit 0
+    fi
+  done
+  sleep 0.2
+done
+
+printf 'FAIL: the service did not return HTTP 200 with body %q from /version.\n' "$expected" >&2
+exit 1

@@ -1,0 +1,22 @@
+{
+  "name": "Git-backed Deployments with Komodo Lab",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "features": {
+    "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {
+      "moby": false
+    }
+  },
+  "forwardPorts": [8080, 9120],
+  "portsAttributes": {
+    "8080": {
+      "label": "Lab 4 service"
+    },
+    "9120": {
+      "label": "Komodo"
+    }
+  },
+  "postStartCommand": "./scripts/start-komodo"
+}
+

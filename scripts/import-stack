@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""Validate and import the Lab 4 Stack through the pinned Komodo API."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import re
+import socket
+import subprocess
+import sys
+import tomllib
+from typing import Any, NoReturn
+from urllib.error import HTTPError, URLError
+from urllib.request import build_opener, ProxyHandler, Request
+
+
+def fail(message: str) -> NoReturn:
+    print(f"FAIL: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def repository_root() -> Path:
+    result = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return Path(result.stdout.strip())
+
+
+def load_dotenv(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, separator, value = line.partition("=")
+        if not separator:
+            fail(f"{path} contains an invalid environment line")
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        values[key.strip()] = value
+    return values
+
+
+def api_request(
+    base_url: str,
+    path: str,
+    body: dict[str, Any],
+    jwt: str | None = None,
+) -> Any:
+    headers = {"content-type": "application/json"}
+    if jwt:
+        headers["authorization"] = jwt
+    request = Request(
+        f"{base_url}{path}",
+        data=json.dumps(body).encode(),
+        headers=headers,
+        method="POST",
+    )
+    try:
+        # The lab Core is local. Bypass any corporate or Codespaces HTTP proxy
+        # so credentials and API traffic never leave the Docker host.
+        with build_opener(ProxyHandler({})).open(request, timeout=10) as response:
+            return json.load(response)
+    except HTTPError as error:
+        try:
+            detail = json.loads(error.read().decode()).get("error", error.reason)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            detail = error.reason
+        raise RuntimeError(f"Komodo returned HTTP {error.code}: {detail}") from error
+
+
+def core_candidates() -> list[str]:
+    candidates = []
+    if configured := os.environ.get("KOMODO_URL"):
+        candidates.append(configured.rstrip("/"))
+    candidates.extend(
+        [
+            "http://127.0.0.1:9120",
+            "http://host.docker.internal:9120",
+        ]
+    )
+    try:
+        result = subprocess.run(
+            ["ip", "route", "show", "default"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        fields = result.stdout.split()
+        if "via" in fields:
+            candidates.append(f"http://{fields[fields.index('via') + 1]}:9120")
+    except FileNotFoundError:
+        pass
+    return list(dict.fromkeys(candidates))
+
+
+def login(credentials: dict[str, str]) -> tuple[str, str]:
+    username = credentials["KOMODO_INIT_ADMIN_USERNAME"]
+    password = credentials["KOMODO_INIT_ADMIN_PASSWORD"]
+    errors = []
+    for base_url in core_candidates():
+        try:
+            response = api_request(
+                base_url,
+                "/auth/login/LoginLocalUser",
+                {"username": username, "password": password},
+            )
+            jwt = response.get("jwt") or response.get("data", {}).get("jwt")
+            if not jwt:
+                raise RuntimeError("local login did not return a JWT")
+            return base_url, jwt
+        except (KeyError, RuntimeError, URLError, TimeoutError, socket.timeout) as error:
+            errors.append(f"{base_url}: {error}")
+    fail("could not log in to local Komodo; run ./scripts/start-komodo\n  " + "\n  ".join(errors))
+
+
+def object_id(resource: dict[str, Any]) -> str:
+    if identifier := resource.get("id"):
+        return identifier
+    mongo_id = resource.get("_id")
+    if isinstance(mongo_id, dict) and mongo_id.get("$oid"):
+        return mongo_id["$oid"]
+    if isinstance(mongo_id, str):
+        return mongo_id
+    fail("Komodo returned a resource without an id")
+
+
+def main() -> None:
+    if len(sys.argv) != 2:
+        print(f"usage: {sys.argv[0]} STACK_TOML", file=sys.stderr)
+        raise SystemExit(2)
+
+    root = repository_root()
+    os.chdir(root)
+    declaration_path = Path(sys.argv[1])
+    if not declaration_path.is_file():
+        fail(f"{declaration_path} does not exist")
+
+    with declaration_path.open("rb") as stream:
+        document = tomllib.load(stream)
+    stacks = document.get("stack", [])
+    stack = next((item for item in stacks if item.get("name") == "lab04"), None)
+    if stack is None:
+        fail("the declaration does not contain a Stack named lab04")
+
+    config = stack.get("config", {})
+    expected = {
+        "server": "local",
+        "project_name": "lab04",
+        "branch": "main",
+        "file_paths": ["compose.yml"],
+    }
+    for field, value in expected.items():
+        if config.get(field) != value:
+            fail(f"stack.config.{field} must be {value!r}")
+
+    repo = config.get("repo", "")
+    if repo == "OWNER/lab-gitops-komodo" or not re.fullmatch(
+        r"[A-Za-z0-9_.-]+/lab-gitops-komodo", repo
+    ):
+        fail("replace the repository placeholder with OWNER/lab-gitops-komodo")
+
+    compose = subprocess.run(
+        ["docker", "compose", "config", "--format", "json"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if compose.returncode:
+        fail(f"compose.yml is invalid:\n{compose.stderr.strip()}")
+    service = json.loads(compose.stdout).get("services", {}).get("lab04-service", {})
+    image = service.get("image", "")
+    if "REPLACE_" in image or not re.fullmatch(r"[^\s]+@sha256:[0-9a-f]{64}", image):
+        fail("replace the Compose image placeholder with a supplied digest-pinned image")
+
+    credentials = load_dotenv(root / ".env.lab")
+    base_url, jwt = login(credentials)
+    server = api_request(base_url, "/read/GetServer", {"server": "local"}, jwt)
+
+    api_config = {
+        "server_id": object_id(server),
+        "project_name": config["project_name"],
+        "auto_pull": bool(config.get("auto_pull", True)),
+        "git_provider": config.get("git_provider", "github.com"),
+        "git_https": True,
+        "repo": repo,
+        "branch": config["branch"],
+        "file_paths": config["file_paths"],
+        "webhook_enabled": False,
+    }
+
+    listed = api_request(base_url, "/read/ListStacks", {"limit": 0}, jwt)
+    existing = next((item for item in listed if item.get("name") == "lab04"), None)
+    if existing:
+        api_request(
+            base_url,
+            "/write/UpdateStack",
+            {"id": object_id(existing), "config": api_config},
+            jwt,
+        )
+        action = "Updated"
+    else:
+        api_request(
+            base_url,
+            "/write/CreateStack",
+            {"name": "lab04", "config": api_config},
+            jwt,
+        )
+        action = "Created"
+
+    imported = api_request(base_url, "/read/GetStack", {"stack": "lab04"}, jwt)
+    imported_config = imported.get("config", {})
+    if imported_config.get("repo") != repo or imported_config.get("branch") != "main":
+        fail("Komodo did not retain the imported Git configuration")
+
+    print(f"{action} Komodo Stack lab04 from {repo}@main.")
+    print("Open http://localhost:9120 and select Stacks > lab04.")
+
+
+if __name__ == "__main__":
+    main()

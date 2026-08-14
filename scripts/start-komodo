@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+repository_root=$(git rev-parse --show-toplevel)
+cd "$repository_root"
+
+for command in docker curl; do
+  if ! command -v "$command" >/dev/null 2>&1; then
+    printf 'FAIL: %s is not available; reopen this repository in its devcontainer.\n' "$command" >&2
+    exit 1
+  fi
+done
+
+readonly compose_file=.devcontainer/komodo.compose.yml
+readonly env_file=.env.lab
+
+docker compose \
+  --file "$compose_file" \
+  --env-file "$env_file" \
+  up --detach --wait
+
+if ! docker compose \
+  --file "$compose_file" \
+  --env-file "$env_file" \
+  exec --no-TTY core \
+  curl --fail --silent --retry 10 --retry-connrefused http://localhost:9120/ \
+  >/dev/null; then
+  printf 'FAIL: Komodo Core did not become ready.\n' >&2
+  exit 1
+fi
+
+printf 'Komodo is ready at http://localhost:9120\n'
+

@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+repository_root=$(git rev-parse --show-toplevel)
+cd "$repository_root" || exit 1
+
+readonly version_2_image='python:3.13.8-alpine3.22@sha256:d74ca7409552835ab7517738e9248d8995ad7c42cba30f3278eb3ee120957d3d'
+failures=0
+temporary_directory=$(mktemp -d)
+started_service=false
+
+cleanup() {
+  if [[ "$started_service" == true ]]; then
+    docker compose down --volumes >/dev/null 2>&1 || true
+  fi
+  rm --recursive --force -- "$temporary_directory"
+}
+trap cleanup EXIT
+
+record_failure() {
+  printf 'FAIL: %s\n' "$1" >&2
+  failures=$((failures + 1))
+}
+
+for command in docker python3 curl; do
+  if ! command -v "$command" >/dev/null 2>&1; then
+    record_failure "$command is not available; reopen this repository in its devcontainer"
+  fi
+done
+
+if ((failures > 0)); then
+  printf '\nLab check stopped because required tools are unavailable.\n' >&2
+  exit 1
+fi
+
+compose_json="$temporary_directory/compose.json"
+declarations_valid=true
+if ! docker compose config --quiet; then
+  record_failure "compose.yml is not valid Docker Compose configuration"
+  declarations_valid=false
+elif ! docker compose config --format json > "$compose_json"; then
+  record_failure "compose.yml could not be normalized for checking"
+  declarations_valid=false
+fi
+
+if [[ "$declarations_valid" == true ]] && ! python3 - "$compose_json" "$version_2_image" <<'PY'
+import json
+import re
+import sys
+import tomllib
+
+compose_path, version_2_image = sys.argv[1:]
+errors = []
+
+with open(compose_path, encoding="utf-8") as stream:
+    compose = json.load(stream)
+
+if compose.get("name") != "lab04":
+    errors.append("Compose project name must be lab04")
+
+service = compose.get("services", {}).get("lab04-service", {})
+if service.get("image") != version_2_image:
+    errors.append("lab04-service must use the supplied version 2 digest")
+if service.get("platform") != "linux/amd64":
+    errors.append("lab04-service platform must remain linux/amd64")
+
+ports = service.get("ports", [])
+publishes_8080 = any(
+    (isinstance(port, str) and port == "8080:8080")
+    or (
+        isinstance(port, dict)
+        and str(port.get("published")) == "8080"
+        and port.get("target") == 8080
+    )
+    for port in ports
+)
+if not publishes_8080:
+    errors.append("lab04-service must publish 8080:8080")
+if not service.get("healthcheck"):
+    errors.append("lab04-service health check is missing")
+
+try:
+    with open("lab04/stack.toml", "rb") as stream:
+        document = tomllib.load(stream)
+except (OSError, tomllib.TOMLDecodeError) as error:
+    errors.append(f"lab04/stack.toml is invalid: {error}")
+else:
+    stacks = document.get("stack", [])
+    stack = next((item for item in stacks if item.get("name") == "lab04"), None)
+    if stack is None:
+        errors.append("lab04 Stack declaration is missing")
+    else:
+        config = stack.get("config", {})
+        expected = {
+            "server": "local",
+            "project_name": "lab04",
+            "branch": "main",
+            "file_paths": ["compose.yml"],
+        }
+        for field, value in expected.items():
+            if config.get(field) != value:
+                errors.append(f"Stack {field} must be {value!r}")
+        repo = config.get("repo", "")
+        if repo == "OWNER/lab-gitops-komodo" or not re.fullmatch(
+            r"[A-Za-z0-9_.-]+/lab-gitops-komodo", repo
+        ):
+            errors.append("Stack repository must name the student fork")
+
+for error in errors:
+    print(f"Declaration check: {error}", file=sys.stderr)
+raise SystemExit(bool(errors))
+PY
+then
+  record_failure "the submitted declarations do not satisfy the Lab 4 contract"
+  declarations_valid=false
+fi
+
+if [[ "$declarations_valid" == true ]]; then
+  if [[ -z "$(docker compose ps --quiet lab04-service 2>/dev/null)" ]]; then
+    started_service=true
+  fi
+
+  printf '\nStarting the final declared service...\n'
+  if ! docker compose up --detach --wait; then
+    record_failure "the final Compose service did not become healthy"
+  elif ! ./scripts/smoke-test 'lab04 version 2'; then
+    record_failure "the final service did not report lab04 version 2"
+  fi
+fi
+
+if ((failures > 0)); then
+  printf '\nLab check failed with %d problem(s).\n' "$failures" >&2
+  exit 1
+fi
+
+printf '\nAll Lab 4 checks passed.\n'

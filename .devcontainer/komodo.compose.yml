@@ -1,0 +1,80 @@
+name: lab04-komodo
+
+services:
+  mongo:
+    image: mongo:8.2.5@sha256:60aa240412f473f672ec8b282fd5651aa156dcc7a220f81f5381ce768ccc3167
+    command: --quiet --wiredTigerCacheSizeGB 0.25
+    restart: unless-stopped
+    labels:
+      komodo.skip: ""
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${KOMODO_DATABASE_USERNAME}
+      MONGO_INITDB_ROOT_PASSWORD: ${KOMODO_DATABASE_PASSWORD}
+    volumes:
+      - mongo-data:/data/db
+      - mongo-config:/data/configdb
+    healthcheck:
+      test:
+        - CMD
+        - mongosh
+        - --quiet
+        - --username
+        - ${KOMODO_DATABASE_USERNAME}
+        - --password
+        - ${KOMODO_DATABASE_PASSWORD}
+        - --authenticationDatabase
+        - admin
+        - --eval
+        - db.adminCommand('ping')
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  core:
+    image: ghcr.io/moghtech/komodo-core:2.3.0@sha256:2662f0f0db66b8d83e438ab15e0693bebe1b3d6c31fe0bf960c1ae6ea6246b83
+    init: true
+    restart: unless-stopped
+    labels:
+      komodo.skip: ""
+    depends_on:
+      mongo:
+        condition: service_healthy
+    ports:
+      - "9120:9120"
+    env_file:
+      - ../.env.lab
+    environment:
+      KOMODO_DATABASE_ADDRESS: mongo:27017
+    volumes:
+      - keys:/config/keys
+      - repo-cache:/repo-cache
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, http://localhost:9120/]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+
+  periphery:
+    image: ghcr.io/moghtech/komodo-periphery:2.3.0@sha256:d5c1b59cad0875c4f08418bbfb465bf69694f3c37f97c6d036647477fbef729d
+    init: true
+    restart: unless-stopped
+    labels:
+      komodo.skip: ""
+    depends_on:
+      core:
+        condition: service_healthy
+    env_file:
+      - ../.env.lab
+    volumes:
+      - keys:/config/keys
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /proc:/proc
+      - periphery-root:/etc/komodo
+
+volumes:
+  keys:
+  mongo-config:
+  mongo-data:
+  periphery-root:
+  repo-cache:
+

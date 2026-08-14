@@ -1,0 +1,12 @@
+[[stack]]
+name = "lab04"
+description = "Lab 4 Git-backed Compose service"
+
+[stack.config]
+server = "local"
+project_name = "lab04"
+git_provider = "github.com"
+repo = "OWNER/lab-gitops-komodo"
+branch = "main"
+file_paths = ["compose.yml"]
+auto_pull = true
