@@ -70,6 +70,6 @@ After deploying through Komodo, verify the reported version:
 ./scripts/smoke-test 'lab04 version 2'
 ```
 
-The final checker expects the version 2 image and removes any service container
-that it created itself. It leaves an already-running Komodo deployment in
-place.
+The final checker expects the version 2 image, verifies that Komodo's deployed
+hash matches the current commit, and checks the running service. It does not
+deploy the Stack or start the service for you.

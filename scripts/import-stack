@@ -132,13 +132,24 @@ def object_id(resource: dict[str, Any]) -> str:
 
 
 def main() -> None:
-    if len(sys.argv) != 2:
-        print(f"usage: {sys.argv[0]} STACK_TOML", file=sys.stderr)
+    verify_commit: str | None = None
+    if len(sys.argv) == 2:
+        declaration_argument = sys.argv[1]
+    elif len(sys.argv) == 4 and sys.argv[1] == "--verify-deployment":
+        declaration_argument = sys.argv[2]
+        verify_commit = sys.argv[3].lower()
+        if not re.fullmatch(r"[0-9a-f]{40}", verify_commit):
+            fail("the expected deployment commit must be a full Git commit hash")
+    else:
+        print(
+            f"usage: {sys.argv[0]} [--verify-deployment] STACK_TOML [COMMIT]",
+            file=sys.stderr,
+        )
         raise SystemExit(2)
 
     root = repository_root()
     os.chdir(root)
-    declaration_path = Path(sys.argv[1])
+    declaration_path = Path(declaration_argument)
     if not declaration_path.is_file():
         fail(f"{declaration_path} does not exist")
 
@@ -181,6 +192,36 @@ def main() -> None:
 
     credentials = load_dotenv(root / ".env.lab")
     base_url, jwt = login(credentials)
+
+    if verify_commit is not None:
+        try:
+            imported = api_request(base_url, "/read/GetStack", {"stack": "lab04"}, jwt)
+        except (RuntimeError, URLError, TimeoutError, socket.timeout) as error:
+            fail(f"could not read the local Komodo Stack: {error}")
+
+        imported_config = imported.get("config", {})
+        expected_imported = {
+            "repo": repo,
+            "branch": config["branch"],
+            "project_name": config["project_name"],
+            "file_paths": config["file_paths"],
+        }
+        for field, value in expected_imported.items():
+            if imported_config.get(field) != value:
+                fail(f"the imported Stack's {field} does not match {declaration_path}")
+
+        deployed_hash = imported.get("info", {}).get("deployed_hash") or ""
+        if not re.fullmatch(r"[0-9a-fA-F]{7,40}", deployed_hash):
+            fail("the local Komodo Stack does not record a deployed Git commit")
+        if not verify_commit.startswith(deployed_hash.lower()):
+            fail(
+                "Komodo deployed commit "
+                f"{deployed_hash}, but the current commit is {verify_commit[:12]}"
+            )
+
+        print(f"Komodo deployed the current commit ({deployed_hash}).")
+        return
+
     server = api_request(base_url, "/read/GetServer", {"server": "local"}, jwt)
 
     api_config = {
