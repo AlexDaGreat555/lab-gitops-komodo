@@ -2,7 +2,7 @@ name: lab04
 
 services:
   lab04-service:
-    image: REPLACE_WITH_VERSION_1_IMAGE
+    image: python:3.13.7-alpine3.22@sha256:527c28b29498575b851ad88e7522ac7201bbd9e920d2c11b00ff2b39b315f5f8
     platform: linux/amd64
     restart: unless-stopped
     ports:
